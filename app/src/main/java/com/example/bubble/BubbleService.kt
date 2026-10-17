@@ -4,18 +4,16 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.ContentValues
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.os.Build
-import android.os.Environment
 import android.os.IBinder
-import android.provider.MediaStore
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -23,22 +21,18 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
-import java.io.File
-import java.util.Locale
 import kotlin.math.abs
-import kotlin.math.exp
-import kotlin.math.sqrt
-import kotlin.random.Random
 
 class BubbleService : Service() {
 
     companion object {
-        private val NAMES = arrayOf("Majority", "Ulta streak", "Last copy", "Last ulta", "Random")
-        private const val N = 5
-        private const val MAX_LOG = 2000
+        private val C_BIG = Color.parseColor("#FF9800")      // orange
+        private val C_SMALL = Color.parseColor("#2196F3")    // blue
+        private val C_PURPLE = Color.parseColor("#6200EE")
+        private val C_GREY = Color.parseColor("#454556")
+        private val C_PANEL = Color.parseColor("#F01E1E2C")
+        private val C_SOFT = Color.parseColor("#B4B4C8")
     }
 
     private lateinit var wm: WindowManager
@@ -46,37 +40,21 @@ class BubbleService : Service() {
     private lateinit var bubble: TextView
     private lateinit var bubbleBg: GradientDrawable
     private lateinit var panel: LinearLayout
-    private lateinit var resultBox: LinearLayout
-    private lateinit var moneyBox: LinearLayout
-    private lateinit var testBox: LinearLayout
-    private lateinit var resultInfo: TextView
-    private lateinit var moneyInfo: TextView
-    private lateinit var testInfo: TextView
+    private lateinit var predText: TextView
+    private lateinit var dotsText: TextView
+    private lateinit var statText: TextView
+    private lateinit var hitText: TextView
+    private lateinit var barBig: View
+    private lateinit var barSmall: View
     private lateinit var bubbleLp: WindowManager.LayoutParams
     private lateinit var panelLp: WindowManager.LayoutParams
 
-    // Poora log (max 2000 result): 'B' = Big, 'S' = Small. Test aur CSV isi se bante hain.
-    private val log = StringBuilder()
-
-    // Rules sirf last 50 result dekhte hain
+    // 'B' = Big, 'S' = Small (sirf last 50 rakhte hain)
     private val history = StringBuilder()
-
-    // Har rule ka apna hit/total
-    private val sHits = IntArray(N)
-    private val sTotal = IntArray(N)
-    private val picks = CharArray(N) { '-' }
-    private var snapHits: IntArray? = null
-    private var snapTotal: IntArray? = null
-    private var sel = 0
-
-    // Money tracker
-    private var net = 0
-    private var bet = 10
-    private var lossLimit = 500
-    private var wins = 0
-    private var losses = 0
-    private var lastDelta: Int? = null
-
+    private var hits = 0
+    private var total = 0
+    private var pred = '-'
+    private var lastCounted = -1   // -1 = kuch nahi, 0 = miss, 1 = hit (undo ke liye)
     private var panelOpen = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -100,11 +78,12 @@ class BubbleService : Service() {
         val size = dp(56)
         bubbleBg = GradientDrawable().apply {
             setShape(GradientDrawable.OVAL)
-            setColor(0xFF6200EE.toInt())
+            setColor(C_PURPLE)
         }
         bubble = TextView(this).apply {
             text = "?"
-            textSize = 18f
+            textSize = 20f
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             background = bubbleBg
@@ -124,75 +103,72 @@ class BubbleService : Service() {
     }
 
     private fun buildPanel() {
-        val bg = GradientDrawable().apply {
-            setColor(0xEE212121.toInt())
-            cornerRadius = dp(16).toFloat()
+        predText = TextView(this).apply {
+            textSize = 24f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(2), 0, dp(2))
         }
-        resultInfo = infoText()
-        moneyInfo = infoText()
-        testInfo = infoText()
-
-        resultBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(resultInfo)
-            addView(row(btn("BIG") { addResult('B') }, btn("SMALL") { addResult('S') }))
-            addView(
-                row(
-                    btn("UNDO") { undoResult() },
-                    btn("RULE") { nextRule() },
-                    btn("RESET") { resetResults() }
-                )
-            )
+        dotsText = TextView(this).apply {
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, dp(6))
         }
-
-        moneyBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            addView(moneyInfo)
-            addView(row(btn("BET -") { changeBet(-10) }, btn("BET +") { changeBet(10) }))
-            addView(
-                row(
-                    btn("WON") { moneyWon() },
-                    btn("LOST") { moneyLost() },
-                    btn("UNDO") { undoMoney() }
-                )
-            )
-            addView(
-                row(
-                    btn("LIMIT -") { changeLimit(-100) },
-                    btn("LIMIT +") { changeLimit(100) },
-                    btn("RESET") { resetMoney() }
-                )
-            )
+        barBig = View(this).apply {
+            setBackgroundColor(C_BIG)
+            layoutParams = LinearLayout.LayoutParams(0, dp(8), 1f)
+        }
+        barSmall = View(this).apply {
+            setBackgroundColor(C_SMALL)
+            layoutParams = LinearLayout.LayoutParams(0, dp(8), 1f)
+        }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(barBig)
+            addView(barSmall)
+        }
+        statText = TextView(this).apply {
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(6), 0, dp(2))
+        }
+        hitText = TextView(this).apply {
+            textSize = 11f
+            gravity = Gravity.CENTER
+            setTextColor(C_SOFT)
+            setPadding(0, dp(2), 0, dp(6))
         }
 
-        val scroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230))
-            addView(testInfo)
+        val rowMain = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(colorBtn("BIG", C_BIG) { addResult('B') })
+            addView(colorBtn("SMALL", C_SMALL) { addResult('S') })
         }
-        testBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            addView(scroll)
-            addView(row(btn("EXPORT CSV") { exportCsv() }))
+        val rowSub = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(colorBtn("UNDO", C_GREY) { undo() })
+            addView(colorBtn("RESET", C_GREY) { reset() })
+            addView(colorBtn("EXIT", C_GREY) { stopSelf() })
         }
 
+        val panelBg = GradientDrawable().apply {
+            setColor(C_PANEL)
+            cornerRadius = dp(18).toFloat()
+        }
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = bg
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = panelBg
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             visibility = View.GONE
-            addView(
-                row(
-                    btn("RESULT") { showTab(0) },
-                    btn("MONEY") { showTab(1) },
-                    btn("TEST") { showTab(2) }
-                )
-            )
-            addView(resultBox)
-            addView(moneyBox)
-            addView(testBox)
-            addView(row(btn("EXIT") { stopSelf() }))
+            addView(predText)
+            addView(dotsText)
+            addView(bar)
+            addView(statText)
+            addView(hitText)
+            addView(rowMain)
+            addView(rowSub)
         }
 
         panelLp = WindowManager.LayoutParams(
@@ -206,24 +182,20 @@ class BubbleService : Service() {
         wm.addView(panel, panelLp)
     }
 
-    private fun infoText() = TextView(this).apply {
-        setTextColor(Color.WHITE)
-        textSize = 12f
-        setPadding(0, dp(6), 0, dp(6))
-    }
-
-    private fun row(vararg views: View) = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        views.forEach { addView(it) }
-    }
-
-    private fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
+    private fun colorBtn(label: String, bgColor: Int, onClick: () -> Unit) = Button(this).apply {
+        val shape = GradientDrawable()
+        shape.setColor(bgColor)
+        shape.cornerRadius = dp(12).toFloat()
         text = label
-        textSize = 11f
-        minHeight = dp(36)
-        minimumHeight = dp(36)
-        setPadding(dp(2), 0, dp(2), 0)
-        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        textSize = 14f
+        typeface = Typeface.DEFAULT_BOLD
+        setTextColor(Color.WHITE)
+        minHeight = dp(44)
+        minimumHeight = dp(44)
+        background = shape
+        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        lp.setMargins(dp(3), dp(3), dp(3), dp(3))
+        layoutParams = lp
         setOnClickListener { onClick() }
     }
 
@@ -268,15 +240,6 @@ class BubbleService : Service() {
         if (panelOpen) positionPanel()
     }
 
-    // tab: 0 = RESULT, 1 = MONEY, 2 = TEST
-    private fun showTab(tab: Int) {
-        resultBox.visibility = if (tab == 0) View.VISIBLE else View.GONE
-        moneyBox.visibility = if (tab == 1) View.VISIBLE else View.GONE
-        testBox.visibility = if (tab == 2) View.VISIBLE else View.GONE
-        refresh()
-        if (panelOpen) positionPanel()
-    }
-
     private fun positionPanel() {
         val dm = resources.displayMetrics
         val w = dp(280)
@@ -295,314 +258,65 @@ class BubbleService : Service() {
         wm.updateViewLayout(panel, panelLp)
     }
 
-    // ---------- Results / Rules ----------
-
-    private fun syncHistory() {
-        history.setLength(0)
-        history.append(log.toString().takeLast(50))
-    }
-
-    private fun pickFor(i: Int): Char {
-        val n = history.length
-        if (n < 10) return '-'
-        val b = history.count { it == 'B' }
-        val s = n - b
-        val last = history[n - 1]
-        val opp = if (last == 'B') 'S' else 'B'
-        var streak = 0
-        for (k in n - 1 downTo 0) {
-            if (history[k] == last) streak++ else break
-        }
-        return when (i) {
-            0 -> if (b >= s) 'B' else 'S'
-            1 -> if (streak >= 3) opp else if (b >= s) 'B' else 'S'
-            2 -> last
-            3 -> opp
-            else -> if (Random.nextBoolean()) 'B' else 'S'
-        }
-    }
-
-    private fun computePicks() {
-        for (i in 0 until N) picks[i] = pickFor(i)
-    }
+    // ---------- Logic ----------
 
     private fun addResult(c: Char) {
-        snapHits = sHits.copyOf()
-        snapTotal = sTotal.copyOf()
-        for (i in 0 until N) {
-            if (picks[i] != '-') {
-                sTotal[i]++
-                if (picks[i] == c) sHits[i]++
-            }
-        }
-        log.append(c)
-        if (log.length > MAX_LOG) log.deleteCharAt(0)
-        syncHistory()
-        computePicks()
-        save()
-        refresh()
-    }
-
-    private fun undoResult() {
-        val sh = snapHits ?: return
-        val st = snapTotal ?: return
-        if (log.isEmpty()) return
-        log.deleteCharAt(log.length - 1)
-        for (i in 0 until N) {
-            sHits[i] = sh[i]
-            sTotal[i] = st[i]
-        }
-        snapHits = null
-        snapTotal = null
-        syncHistory()
-        computePicks()
-        save()
-        refresh()
-    }
-
-    private fun resetResults() {
-        log.setLength(0)
-        syncHistory()
-        sHits.fill(0)
-        sTotal.fill(0)
-        snapHits = null
-        snapTotal = null
-        computePicks()
-        save()
-        refresh()
-    }
-
-    private fun nextRule() {
-        sel = (sel + 1) % N
-        save()
-        refresh()
-    }
-
-    // ---------- Money ----------
-
-    private fun changeBet(d: Int) {
-        bet = (bet + d).coerceAtLeast(10)
-        save()
-        refresh()
-    }
-
-    private fun changeLimit(d: Int) {
-        lossLimit = (lossLimit + d).coerceAtLeast(100)
-        save()
-        refresh()
-    }
-
-    private fun moneyWon() {
-        net += bet
-        wins++
-        lastDelta = bet
-        save()
-        refresh()
-    }
-
-    private fun moneyLost() {
-        net -= bet
-        losses++
-        lastDelta = -bet
-        save()
-        refresh()
-    }
-
-    private fun undoMoney() {
-        val d = lastDelta ?: return
-        net -= d
-        if (d > 0) wins-- else losses--
-        lastDelta = null
-        save()
-        refresh()
-    }
-
-    private fun resetMoney() {
-        net = 0
-        wins = 0
-        losses = 0
-        lastDelta = null
-        save()
-        refresh()
-    }
-
-    // ---------- Randomness test ----------
-
-    // Abramowitz-Stegun 7.1.26 approximation, x >= 0
-    private fun erfc(x: Double): Double {
-        val t = 1.0 / (1.0 + 0.3275911 * x)
-        val poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t
-        return minOf(1.0, poly * exp(-x * x))
-    }
-
-    // chi-square, 1 degree of freedom
-    private fun pFromChi1(chi: Double) = erfc(sqrt(chi / 2.0))
-
-    // z-score, two-sided
-    private fun pFromZ(z: Double) = erfc(abs(z) / sqrt(2.0))
-
-    private fun fmt(x: Double) = String.format(Locale.US, "%.3f", x)
-
-    private fun verdict(p: Double) = if (p >= 0.05) "-> random jaisa (OK)" else "-> alag dikh raha"
-
-    private fun testText(): String {
-        val s = log.toString()
-        val n = s.length
-        val sb = StringBuilder()
-        sb.append("Total result daale: $n\n")
-        if (n < 30) {
-            sb.append("\nData abhi bahut kam hai. Kam se kam 100 result daalo (zyada ho to behtar), tab test ka matlab hoga.")
-            return sb.toString()
-        }
-
-        var flagged = 0
-        val b = s.count { it == 'B' }
-        val sm = n - b
-
-        // 1) Big/Small barabar aate hain? (chi-square)
-        val chi = (b - sm).toDouble() * (b - sm).toDouble() / n
-        val p1 = pFromChi1(chi)
-        if (p1 < 0.05) flagged++
-        sb.append("\n1) Big/Small barabar aate hain?\n")
-        sb.append("   Big $b | Small $sm\n")
-        sb.append("   chi2=${fmt(chi)}, p=${fmt(p1)} ${verdict(p1)}\n")
-
-        // 2) Runs test: streak zyada ya kam banti hain?
-        if (b > 0 && sm > 0) {
-            var runs = 1
-            for (i in 1 until n) {
-                if (s[i] != s[i - 1]) runs++
-            }
-            val mu = 2.0 * b * sm / n + 1.0
-            val v = (mu - 1.0) * (mu - 2.0) / (n - 1.0)
-            if (v > 0) {
-                val z = (runs - mu) / sqrt(v)
-                val p2 = pFromZ(z)
-                if (p2 < 0.05) flagged++
-                sb.append("\n2) Streak normal hain? (runs test)\n")
-                sb.append("   Runs: $runs, expected ${fmt(mu)}\n")
-                sb.append("   z=${fmt(z)}, p=${fmt(p2)} ${verdict(p2)}\n")
-            }
-        }
-
-        // 3) Pichla result agle ko affect karta hai? (chi-square, 2x2)
-        var bb = 0
-        var bs = 0
-        var sb2 = 0
-        var ss = 0
-        for (i in 1 until n) {
-            val a = s[i - 1]
-            val c = s[i]
-            if (a == 'B') {
-                if (c == 'B') bb++ else bs++
+        if (pred != '-') {
+            total++
+            if (pred == c) {
+                hits++
+                lastCounted = 1
             } else {
-                if (c == 'B') sb2++ else ss++
+                lastCounted = 0
             }
-        }
-        val m = bb + bs + sb2 + ss
-        val den = (bb + bs).toDouble() * (sb2 + ss) * (bb + sb2) * (bs + ss)
-        if (den > 0) {
-            val cross = bb.toDouble() * ss - bs.toDouble() * sb2
-            val chi3 = m * cross * cross / den
-            val p3 = pFromChi1(chi3)
-            if (p3 < 0.05) flagged++
-            val afterB = bb * 100 / (bb + bs)
-            val afterS = sb2 * 100 / (sb2 + ss)
-            sb.append("\n3) Pichla result agle ko affect karta hai?\n")
-            sb.append("   Big ke baad Big: $afterB% | Small ke baad Big: $afterS%\n")
-            sb.append("   chi2=${fmt(chi3)}, p=${fmt(p3)} ${verdict(p3)}\n")
-        }
-
-        // 4) Sabse achha rule sach me 50% se upar hai?
-        var best = -1
-        var bestZ = -1e9
-        for (i in 0 until N) {
-            if (sTotal[i] >= 20) {
-                val z = (sHits[i] - 0.5 * sTotal[i]) / sqrt(0.25 * sTotal[i])
-                if (z > bestZ) {
-                    bestZ = z
-                    best = i
-                }
-            }
-        }
-        if (best >= 0) {
-            val rate = sHits[best] * 100 / sTotal[best]
-            val p = pFromZ(bestZ)
-            val adj = minOf(1.0, p * N)
-            if (adj < 0.05) flagged++
-            sb.append("\n4) Sabse achha rule: ${NAMES[best]}\n")
-            sb.append("   Hit ${sHits[best]}/${sTotal[best]} ($rate%)\n")
-            sb.append("   p=${fmt(p)}. $N rules me se best chuna, isliye adjusted p=${fmt(adj)} ${verdict(adj)}\n")
-        }
-
-        sb.append("\n")
-        if (flagged == 0) {
-            sb.append("Nateeja: koi pattern nahi mila. Pichle results se agla result predict karne ka koi aadhar nahi dikh raha.")
         } else {
-            sb.append("Nateeja: $flagged test 'alag' dikha rahe hain. Itne data me ye aksar sanyog hota hai, kyunki har test 20 me se 1 baar galti se 'alag' bata deta hai. Aur result daalo; sach me pattern hota to bade sample me bhi rehta, par aksar ye wapas random ho jata hai.")
+            lastCounted = -1
         }
-        return sb.toString()
+        history.append(c)
+        if (history.length > 50) history.deleteCharAt(0)
+        pred = predict()
+        save()
+        refresh()
     }
 
-    // ---------- CSV export ----------
-
-    private fun buildCsv(): String {
-        val s = log.toString()
-        val sb = StringBuilder("round,result,big_total,small_total\n")
-        var b = 0
-        var sm = 0
-        for (i in s.indices) {
-            val name: String
-            if (s[i] == 'B') {
-                b++
-                name = "Big"
-            } else {
-                sm++
-                name = "Small"
-            }
-            sb.append("${i + 1},$name,$b,$sm\n")
+    private fun undo() {
+        if (history.isEmpty()) return
+        history.deleteCharAt(history.length - 1)
+        if (lastCounted != -1) {
+            total--
+            if (lastCounted == 1) hits--
+            lastCounted = -1
         }
-        return sb.toString()
+        pred = predict()
+        save()
+        refresh()
     }
 
-    private fun exportCsv() {
-        if (log.isEmpty()) {
-            Toast.makeText(this, "Abhi koi result nahi hai", Toast.LENGTH_SHORT).show()
-            return
+    private fun reset() {
+        history.setLength(0)
+        hits = 0
+        total = 0
+        lastCounted = -1
+        pred = '-'
+        save()
+        refresh()
+    }
+
+    // Simple rule: 3+ streak ho to ulta, warna jo zyada aaya wahi.
+    private fun predict(): Char {
+        if (history.length < 10) return '-'
+        val b = history.count { it == 'B' }
+        val s = history.length - b
+        val last = history[history.length - 1]
+        var streak = 0
+        for (i in history.length - 1 downTo 0) {
+            if (history[i] == last) streak++ else break
         }
-        val csv = buildCsv()
-        val name = "bubble_results_" + System.currentTimeMillis() + ".csv"
-        var msg = ""
-        try {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, name)
-                    put(MediaStore.Downloads.MIME_TYPE, "text/csv")
-                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                }
-                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    contentResolver.openOutputStream(uri)?.use { it.write(csv.toByteArray()) }
-                    msg = "Downloads me save hua: $name"
-                } else {
-                    msg = "File save nahi ho payi"
-                }
-            } else {
-                val f = File(getExternalFilesDir(null), name)
-                f.writeText(csv)
-                msg = "Save hua: ${f.absolutePath}"
-            }
-        } catch (e: Exception) {
-            msg = "Export fail: ${e.message}"
+        return when {
+            streak >= 3 -> if (last == 'B') 'S' else 'B'
+            b >= s -> 'B'
+            else -> 'S'
         }
-        try {
-            val cm = getSystemService(ClipboardManager::class.java)
-            cm.setPrimaryClip(ClipData.newPlainText("bubble", csv))
-            msg += " (clipboard me bhi copy hua)"
-        } catch (e: Exception) {
-            // clipboard na chale to koi baat nahi
-        }
-        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     }
 
     // ---------- Show ----------
@@ -610,74 +324,77 @@ class BubbleService : Service() {
     private fun refresh() {
         val n = history.length
         val b = history.count { it == 'B' }
+        val s = n - b
 
-        val sb = StringBuilder()
-        sb.append("Last $n: Big $b | Small ${n - b}\n")
-        for (i in 0 until N) {
-            val p = when (picks[i]) {
-                'B' -> "BIG"
-                'S' -> "SMALL"
-                else -> "-"
+        when (pred) {
+            'B' -> {
+                predText.textSize = 26f
+                predText.text = "NEXT: BIG"
+                predText.setTextColor(C_BIG)
             }
-            val rate = if (sTotal[i] > 0) sHits[i] * 100 / sTotal[i] else 0
-            val mark = if (i == sel) "> " else "   "
-            sb.append("$mark${NAMES[i]}: $p  ${sHits[i]}/${sTotal[i]} ($rate%)\n")
+            'S' -> {
+                predText.textSize = 26f
+                predText.text = "NEXT: SMALL"
+                predText.setTextColor(C_SMALL)
+            }
+            else -> {
+                predText.textSize = 16f
+                predText.text = "Pehle 10 result daalo ($n/10)"
+                predText.setTextColor(Color.WHITE)
+            }
         }
-        if (n < 10) sb.append("Prediction ke liye ${10 - n} result aur daalo")
-        resultInfo.text = sb.toString().trimEnd()
 
-        val limitHit = net <= -lossLimit
-        val sign = if (net >= 0) "+" else "-"
-        var m = "Net P/L: ${sign}Rs ${abs(net)}\n" +
-                "Won $wins | Lost $losses\n" +
-                "Bet: Rs $bet | Loss limit: Rs $lossLimit"
-        if (limitHit) m += "\n!! LIMIT CROSS !! Ab ruk jao."
-        moneyInfo.text = m
+        // Last 18 result ke rangeen dots (purana left, naya right)
+        val dots = SpannableStringBuilder()
+        for (ch in history.toString().takeLast(18)) {
+            val start = dots.length
+            dots.append("\u25CF\u2009")
+            dots.setSpan(
+                ForegroundColorSpan(if (ch == 'B') C_BIG else C_SMALL),
+                start, dots.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        dotsText.text = dots
 
-        if (testBox.visibility == View.VISIBLE) testInfo.text = testText()
+        val wb = if (n == 0) 1f else b.toFloat()
+        val ws = if (n == 0) 1f else s.toFloat()
+        barBig.layoutParams = LinearLayout.LayoutParams(0, dp(8), wb)
+        barSmall.layoutParams = LinearLayout.LayoutParams(0, dp(8), ws)
 
-        bubble.text = when (picks[sel]) {
+        statText.text = "Big $b  |  Small $s   (last $n)"
+        val rate = if (total > 0) hits * 100 / total else 0
+        hitText.text = "Hit rate: $hits/$total ($rate%) \u2022 50% = coin flip"
+
+        bubble.text = when (pred) {
             'B' -> "B"
             'S' -> "S"
             else -> "?"
         }
-        bubbleBg.setColor(if (limitHit) 0xFFD32F2F.toInt() else 0xFF6200EE.toInt())
+        bubbleBg.setColor(
+            when (pred) {
+                'B' -> C_BIG
+                'S' -> C_SMALL
+                else -> C_PURPLE
+            }
+        )
     }
-
-    // ---------- Save / Load ----------
 
     private fun load() {
         val saved = prefs.getString("log", null) ?: prefs.getString("h", "") ?: ""
-        log.append(saved)
-        while (log.length > MAX_LOG) log.deleteCharAt(0)
-        syncHistory()
-        for (i in 0 until N) {
-            sHits[i] = prefs.getInt("sh$i", 0)
-            sTotal[i] = prefs.getInt("st$i", 0)
-        }
-        sel = prefs.getInt("sel", 0).coerceIn(0, N - 1)
-        net = prefs.getInt("net", 0)
-        bet = prefs.getInt("bet", 10)
-        lossLimit = prefs.getInt("lim", 500)
-        wins = prefs.getInt("wins", 0)
-        losses = prefs.getInt("losses", 0)
-        computePicks()
+        history.append(saved.takeLast(50))
+        hits = prefs.getInt("hits", 0)
+        total = prefs.getInt("total", 0)
+        lastCounted = prefs.getInt("lc", -1)
+        pred = predict()
     }
 
     private fun save() {
-        val e = prefs.edit()
-        e.putString("log", log.toString())
-        for (i in 0 until N) {
-            e.putInt("sh$i", sHits[i])
-            e.putInt("st$i", sTotal[i])
-        }
-        e.putInt("sel", sel)
-        e.putInt("net", net)
-        e.putInt("bet", bet)
-        e.putInt("lim", lossLimit)
-        e.putInt("wins", wins)
-        e.putInt("losses", losses)
-        e.apply()
+        prefs.edit()
+            .putString("log", history.toString())
+            .putInt("hits", hits)
+            .putInt("total", total)
+            .putInt("lc", lastCounted)
+            .apply()
     }
 
     // ---------- Service ----------
