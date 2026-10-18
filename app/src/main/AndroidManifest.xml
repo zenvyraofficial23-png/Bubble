@@ -18,6 +18,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".InputActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Material.Light.Dialog"/>
+
         <service
             android:name=".BubbleService"
             android:exported="false"

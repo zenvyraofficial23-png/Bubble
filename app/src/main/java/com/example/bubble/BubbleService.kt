@@ -33,6 +33,11 @@ class BubbleService : Service() {
         private val C_GREY = Color.parseColor("#454556")
         private val C_PANEL = Color.parseColor("#F01E1E2C")
         private val C_SOFT = Color.parseColor("#B4B4C8")
+        private val BS_NAMES = arrayOf("Cold number", "Ulta streak", "Majority", "Last ulta", "Last copy")
+        private val NUM_NAMES = arrayOf("Cold-3", "Hot-3")
+        private const val NB = 5      // Big/Small ke rules
+        private const val NN = 2      // number ke rules
+        private const val PW = 290    // panel width (dp)
     }
 
     private lateinit var wm: WindowManager
@@ -41,7 +46,8 @@ class BubbleService : Service() {
     private lateinit var bubbleBg: GradientDrawable
     private lateinit var panel: LinearLayout
     private lateinit var predText: TextView
-    private lateinit var dotsText: TextView
+    private lateinit var numText: TextView
+    private lateinit var stripText: TextView
     private lateinit var statText: TextView
     private lateinit var hitText: TextView
     private lateinit var barBig: View
@@ -49,12 +55,27 @@ class BubbleService : Service() {
     private lateinit var bubbleLp: WindowManager.LayoutParams
     private lateinit var panelLp: WindowManager.LayoutParams
 
-    // 'B' = Big, 'S' = Small (sirf last 50 rakhte hain)
+    // Sirf digits '0'..'9' (last 50 result, purana pehle). 0-4 = Small, 5-9 = Big.
     private val history = StringBuilder()
-    private var hits = 0
-    private var total = 0
-    private var pred = '-'
-    private var lastCounted = -1   // -1 = kuch nahi, 0 = miss, 1 = hit (undo ke liye)
+
+    // Big/Small rules ka hit/total
+    private val sHits = IntArray(NB)
+    private val sTotal = IntArray(NB)
+    private val bsPicks = CharArray(NB) { '-' }
+
+    // 3-number rules ka hit/total
+    private val nHits = IntArray(NN)
+    private val nTotal = IntArray(NN)
+    private val numPicks = Array(NN) { IntArray(3) { -1 } }
+
+    // Undo ke liye snapshot
+    private var snapSH: IntArray? = null
+    private var snapST: IntArray? = null
+    private var snapNH: IntArray? = null
+    private var snapNT: IntArray? = null
+
+    private var selBs = 0
+    private var selNum = 0
     private var panelOpen = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -68,6 +89,16 @@ class BubbleService : Service() {
         buildBubble()
         buildPanel()
         refresh()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val d = intent?.getStringExtra("digits")
+        if (d != null) {
+            for (ch in d) {
+                if (ch in '0'..'9') addDigit(ch - '0', false)
+            }
+        }
+        return START_STICKY
     }
 
     // ---------- UI ----------
@@ -110,10 +141,18 @@ class BubbleService : Service() {
             setTextColor(Color.WHITE)
             setPadding(0, dp(2), 0, dp(2))
         }
-        dotsText = TextView(this).apply {
-            textSize = 14f
+        numText = TextView(this).apply {
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, dp(6))
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(2), 0, dp(4))
+        }
+        stripText = TextView(this).apply {
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(0, dp(2), 0, dp(6))
         }
         barBig = View(this).apply {
             setBackgroundColor(C_BIG)
@@ -141,16 +180,17 @@ class BubbleService : Service() {
             setPadding(0, dp(2), 0, dp(6))
         }
 
-        val rowMain = LinearLayout(this).apply {
+        val rowCtl1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(colorBtn("BIG", C_BIG) { addResult('B') })
-            addView(colorBtn("SMALL", C_SMALL) { addResult('S') })
+            addView(colorBtn("UNDO", C_GREY, 12f, 40) { undo() })
+            addView(colorBtn("RULE", C_GREY, 12f, 40) { nextBsRule() })
+            addView(colorBtn("NUM", C_GREY, 12f, 40) { nextNumRule() })
         }
-        val rowSub = LinearLayout(this).apply {
+        val rowCtl2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(colorBtn("UNDO", C_GREY) { undo() })
-            addView(colorBtn("RESET", C_GREY) { reset() })
-            addView(colorBtn("EXIT", C_GREY) { stopSelf() })
+            addView(colorBtn("PASTE", C_GREY, 12f, 40) { openInput() })
+            addView(colorBtn("RESET", C_GREY, 12f, 40) { reset() })
+            addView(colorBtn("EXIT", C_GREY, 12f, 40) { stopSelf() })
         }
 
         val panelBg = GradientDrawable().apply {
@@ -163,16 +203,19 @@ class BubbleService : Service() {
             setPadding(dp(12), dp(10), dp(12), dp(10))
             visibility = View.GONE
             addView(predText)
-            addView(dotsText)
+            addView(numText)
+            addView(stripText)
             addView(bar)
             addView(statText)
             addView(hitText)
-            addView(rowMain)
-            addView(rowSub)
+            addView(numRow(0, 4))
+            addView(numRow(5, 9))
+            addView(rowCtl1)
+            addView(rowCtl2)
         }
 
         panelLp = WindowManager.LayoutParams(
-            dp(280), WindowManager.LayoutParams.WRAP_CONTENT,
+            dp(PW), WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
@@ -182,19 +225,33 @@ class BubbleService : Service() {
         wm.addView(panel, panelLp)
     }
 
-    private fun colorBtn(label: String, bgColor: Int, onClick: () -> Unit) = Button(this).apply {
+    private fun numRow(from: Int, to: Int) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        for (d in from..to) {
+            addView(colorBtn(d.toString(), if (d >= 5) C_BIG else C_SMALL, 17f, 38) { addDigit(d, true) })
+        }
+    }
+
+    private fun colorBtn(
+        label: String,
+        bgColor: Int,
+        textSz: Float = 14f,
+        minH: Int = 44,
+        onClick: () -> Unit
+    ) = Button(this).apply {
         val shape = GradientDrawable()
         shape.setColor(bgColor)
         shape.cornerRadius = dp(12).toFloat()
         text = label
-        textSize = 14f
+        textSize = textSz
         typeface = Typeface.DEFAULT_BOLD
         setTextColor(Color.WHITE)
-        minHeight = dp(44)
-        minimumHeight = dp(44)
+        minHeight = dp(minH)
+        minimumHeight = dp(minH)
+        setPadding(0, 0, 0, 0)
         background = shape
         val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        lp.setMargins(dp(3), dp(3), dp(3), dp(3))
+        lp.setMargins(dp(2), dp(2), dp(2), dp(2))
         layoutParams = lp
         setOnClickListener { onClick() }
     }
@@ -242,7 +299,7 @@ class BubbleService : Service() {
 
     private fun positionPanel() {
         val dm = resources.displayMetrics
-        val w = dp(280)
+        val w = dp(PW)
         panel.measure(
             View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
             View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
@@ -258,75 +315,167 @@ class BubbleService : Service() {
         wm.updateViewLayout(panel, panelLp)
     }
 
-    // ---------- Logic ----------
+    private fun openInput() {
+        panelOpen = false
+        panel.visibility = View.GONE
+        val i = Intent(this, InputActivity::class.java)
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(i)
+    }
 
-    private fun addResult(c: Char) {
-        if (pred != '-') {
-            total++
-            if (pred == c) {
-                hits++
-                lastCounted = 1
-            } else {
-                lastCounted = 0
+    // ---------- Predictions ----------
+
+    private fun computePicks() {
+        for (i in 0 until NB) bsPicks[i] = '-'
+        for (j in 0 until NN) {
+            for (k in 0 until 3) numPicks[j][k] = -1
+        }
+        val n = history.length
+        if (n < 10) return
+
+        val nums = IntArray(n) { history[it] - '0' }
+        val sides = CharArray(n) { if (nums[it] >= 5) 'B' else 'S' }
+        val b = sides.count { it == 'B' }
+        val s = n - b
+        val last = sides[n - 1]
+        val opp = if (last == 'B') 'S' else 'B'
+        var streak = 0
+        for (k in n - 1 downTo 0) {
+            if (sides[k] == last) streak++ else break
+        }
+        val major = if (b >= s) 'B' else 'S'
+
+        // 0: Cold number. Pichle 15 round me jo number nahi aaya, unme sabse purana; uska side.
+        if (n >= 15) {
+            var coldDigit = -1
+            var coldLast = Int.MAX_VALUE
+            for (d in 0..9) {
+                var lastSeen = -1
+                for (i in 0 until n) {
+                    if (nums[i] == d) lastSeen = i
+                }
+                val seenRecently = lastSeen >= n - 15
+                if (!seenRecently && lastSeen < coldLast) {
+                    coldLast = lastSeen
+                    coldDigit = d
+                }
+            }
+            if (coldDigit >= 0) bsPicks[0] = if (coldDigit >= 5) 'B' else 'S'
+        }
+        bsPicks[1] = if (streak >= 3) opp else major   // Ulta streak
+        bsPicks[2] = major                             // Majority
+        bsPicks[3] = opp                               // Last ulta
+        bsPicks[4] = last                              // Last copy
+
+        // 3-number rules
+        val cnt = IntArray(10)
+        val lastIdx = IntArray(10) { -1 }
+        for (i in 0 until n) {
+            cnt[nums[i]]++
+            lastIdx[nums[i]] = i
+        }
+        val gap = IntArray(10) { if (lastIdx[it] < 0) n + 1 else n - 1 - lastIdx[it] }
+        val cold = (0..9).sortedWith(compareBy<Int>({ -gap[it] }, { it })).take(3)
+        val hot = (0..9).sortedWith(compareBy<Int>({ -cnt[it] }, { -lastIdx[it] }, { it })).take(3)
+        for (k in 0 until 3) {
+            numPicks[0][k] = cold[k]
+            numPicks[1][k] = hot[k]
+        }
+    }
+
+    private fun addDigit(d: Int, score: Boolean) {
+        if (score) {
+            snapSH = sHits.copyOf()
+            snapST = sTotal.copyOf()
+            snapNH = nHits.copyOf()
+            snapNT = nTotal.copyOf()
+            val side = if (d >= 5) 'B' else 'S'
+            for (i in 0 until NB) {
+                if (bsPicks[i] != '-') {
+                    sTotal[i]++
+                    if (bsPicks[i] == side) sHits[i]++
+                }
+            }
+            for (j in 0 until NN) {
+                if (numPicks[j][0] >= 0) {
+                    nTotal[j]++
+                    if (numPicks[j].contains(d)) nHits[j]++
+                }
             }
         } else {
-            lastCounted = -1
+            clearSnap()
         }
-        history.append(c)
+        history.append('0' + d)
         if (history.length > 50) history.deleteCharAt(0)
-        pred = predict()
+        computePicks()
         save()
         refresh()
     }
 
+    private fun clearSnap() {
+        snapSH = null
+        snapST = null
+        snapNH = null
+        snapNT = null
+    }
+
     private fun undo() {
+        val a = snapSH ?: return
+        val b = snapST ?: return
+        val c = snapNH ?: return
+        val e = snapNT ?: return
         if (history.isEmpty()) return
         history.deleteCharAt(history.length - 1)
-        if (lastCounted != -1) {
-            total--
-            if (lastCounted == 1) hits--
-            lastCounted = -1
+        for (i in 0 until NB) {
+            sHits[i] = a[i]
+            sTotal[i] = b[i]
         }
-        pred = predict()
+        for (j in 0 until NN) {
+            nHits[j] = c[j]
+            nTotal[j] = e[j]
+        }
+        clearSnap()
+        computePicks()
         save()
         refresh()
     }
 
     private fun reset() {
         history.setLength(0)
-        hits = 0
-        total = 0
-        lastCounted = -1
-        pred = '-'
+        sHits.fill(0)
+        sTotal.fill(0)
+        nHits.fill(0)
+        nTotal.fill(0)
+        clearSnap()
+        computePicks()
         save()
         refresh()
     }
 
-    // Simple rule: 3+ streak ho to ulta, warna jo zyada aaya wahi.
-    private fun predict(): Char {
-        if (history.length < 10) return '-'
-        val b = history.count { it == 'B' }
-        val s = history.length - b
-        val last = history[history.length - 1]
-        var streak = 0
-        for (i in history.length - 1 downTo 0) {
-            if (history[i] == last) streak++ else break
-        }
-        return when {
-            streak >= 3 -> if (last == 'B') 'S' else 'B'
-            b >= s -> 'B'
-            else -> 'S'
-        }
+    private fun nextBsRule() {
+        selBs = (selBs + 1) % NB
+        save()
+        refresh()
+    }
+
+    private fun nextNumRule() {
+        selNum = (selNum + 1) % NN
+        save()
+        refresh()
     }
 
     // ---------- Show ----------
 
     private fun refresh() {
         val n = history.length
-        val b = history.count { it == 'B' }
+        var b = 0
+        for (c in history) {
+            if (c >= '5') b++
+        }
         val s = n - b
 
-        when (pred) {
+        val pr = bsPicks[selBs]
+        when (pr) {
             'B' -> {
                 predText.textSize = 26f
                 predText.text = "NEXT: BIG"
@@ -339,22 +488,42 @@ class BubbleService : Service() {
             }
             else -> {
                 predText.textSize = 16f
-                predText.text = "Pehle 10 result daalo ($n/10)"
+                predText.text = if (n < 10) "Pehle 10 number daalo ($n/10)" else "Is rule ka abhi koi signal nahi"
                 predText.setTextColor(Color.WHITE)
             }
         }
 
-        // Last 18 result ke rangeen dots (purana left, naya right)
-        val dots = SpannableStringBuilder()
-        for (ch in history.toString().takeLast(18)) {
-            val start = dots.length
-            dots.append("\u25CF\u2009")
-            dots.setSpan(
-                ForegroundColorSpan(if (ch == 'B') C_BIG else C_SMALL),
-                start, dots.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-            )
+        // 3 numbers
+        val nm = SpannableStringBuilder()
+        val pk = numPicks[selNum]
+        if (pk[0] >= 0) {
+            nm.append("3 NUMBERS:  ")
+            for (k in 0 until 3) {
+                val start = nm.length
+                nm.append(pk[k].toString())
+                nm.setSpan(
+                    ForegroundColorSpan(if (pk[k] >= 5) C_BIG else C_SMALL),
+                    start, nm.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                )
+                if (k < 2) nm.append("   ")
+            }
+        } else {
+            nm.append("3 NUMBERS: -")
         }
-        dotsText.text = dots
+        numText.text = nm
+
+        // Last 16 number (purana left, naya right)
+        val strip = SpannableStringBuilder()
+        for (ch in history.toString().takeLast(16)) {
+            val start = strip.length
+            strip.append(ch.toString())
+            strip.setSpan(
+                ForegroundColorSpan(if (ch >= '5') C_BIG else C_SMALL),
+                start, strip.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+            strip.append(" ")
+        }
+        stripText.text = strip
 
         val wb = if (n == 0) 1f else b.toFloat()
         val ws = if (n == 0) 1f else s.toFloat()
@@ -362,16 +531,18 @@ class BubbleService : Service() {
         barSmall.layoutParams = LinearLayout.LayoutParams(0, dp(8), ws)
 
         statText.text = "Big $b  |  Small $s   (last $n)"
-        val rate = if (total > 0) hits * 100 / total else 0
-        hitText.text = "Hit rate: $hits/$total ($rate%) \u2022 50% = coin flip"
+        val r1 = if (sTotal[selBs] > 0) sHits[selBs] * 100 / sTotal[selBs] else 0
+        val r2 = if (nTotal[selNum] > 0) nHits[selNum] * 100 / nTotal[selNum] else 0
+        hitText.text = "B/S [${BS_NAMES[selBs]}]  ${sHits[selBs]}/${sTotal[selBs]} ($r1%)  coin 50%\n" +
+                "Num [${NUM_NAMES[selNum]}]  ${nHits[selNum]}/${nTotal[selNum]} ($r2%)  random 30%"
 
-        bubble.text = when (pred) {
+        bubble.text = when (pr) {
             'B' -> "B"
             'S' -> "S"
             else -> "?"
         }
         bubbleBg.setColor(
-            when (pred) {
+            when (pr) {
                 'B' -> C_BIG
                 'S' -> C_SMALL
                 else -> C_PURPLE
@@ -379,22 +550,38 @@ class BubbleService : Service() {
         )
     }
 
+    // ---------- Save / Load ----------
+
     private fun load() {
-        val saved = prefs.getString("log", null) ?: prefs.getString("h", "") ?: ""
-        history.append(saved.takeLast(50))
-        hits = prefs.getInt("hits", 0)
-        total = prefs.getInt("total", 0)
-        lastCounted = prefs.getInt("lc", -1)
-        pred = predict()
+        val saved = prefs.getString("log", null) ?: ""
+        history.append(saved.filter { it in '0'..'9' }.takeLast(50))
+        for (i in 0 until NB) {
+            sHits[i] = prefs.getInt("bsh$i", 0)
+            sTotal[i] = prefs.getInt("bst$i", 0)
+        }
+        for (j in 0 until NN) {
+            nHits[j] = prefs.getInt("nh$j", 0)
+            nTotal[j] = prefs.getInt("nt$j", 0)
+        }
+        selBs = prefs.getInt("selbs", 0).coerceIn(0, NB - 1)
+        selNum = prefs.getInt("selnum", 0).coerceIn(0, NN - 1)
+        computePicks()
     }
 
     private fun save() {
-        prefs.edit()
-            .putString("log", history.toString())
-            .putInt("hits", hits)
-            .putInt("total", total)
-            .putInt("lc", lastCounted)
-            .apply()
+        val e = prefs.edit()
+        e.putString("log", history.toString())
+        for (i in 0 until NB) {
+            e.putInt("bsh$i", sHits[i])
+            e.putInt("bst$i", sTotal[i])
+        }
+        for (j in 0 until NN) {
+            e.putInt("nh$j", nHits[j])
+            e.putInt("nt$j", nTotal[j])
+        }
+        e.putInt("selbs", selBs)
+        e.putInt("selnum", selNum)
+        e.apply()
     }
 
     // ---------- Service ----------
