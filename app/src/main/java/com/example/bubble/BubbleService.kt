@@ -22,6 +22,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.util.Locale
 import kotlin.math.abs
 
 class BubbleService : Service() {
@@ -33,17 +34,39 @@ class BubbleService : Service() {
         private val C_GREY = Color.parseColor("#454556")
         private val C_PANEL = Color.parseColor("#F01E1E2C")
         private val C_SOFT = Color.parseColor("#B4B4C8")
+        private val C_GREEN = Color.parseColor("#2E7D32")
+        private val C_RED = Color.parseColor("#D32F2F")
+        private val C_RED_SOFT = Color.parseColor("#FF6B6B")
+
+        // Tumhari history se: jo stakes tum sach me lagate ho
+        private val STAKES = intArrayOf(1, 5, 10, 20, 50, 100, 200, 500)
+        private val TYPES = arrayOf("Big/Small", "Colour", "Number")
+        // Jeetne par net profit = stake x ye (game ka asli payout, 2% fee ke baad)
+        private val PROFIT = doubleArrayOf(0.96, 0.96, 7.82)
     }
+
+    private class MoneyState(
+        val net: Double,
+        val wins: Int,
+        val losses: Int,
+        val lossStreak: Int,
+        val staked: Double,
+        val lastStake: Int,
+        val lastLost: Boolean
+    )
 
     private lateinit var wm: WindowManager
     private lateinit var prefs: SharedPreferences
     private lateinit var bubble: TextView
     private lateinit var bubbleBg: GradientDrawable
     private lateinit var panel: LinearLayout
+    private lateinit var mainBox: LinearLayout
+    private lateinit var moneyBox: LinearLayout
     private lateinit var predText: TextView
     private lateinit var dotsText: TextView
     private lateinit var statText: TextView
     private lateinit var hitText: TextView
+    private lateinit var moneyInfo: TextView
     private lateinit var barBig: View
     private lateinit var barSmall: View
     private lateinit var bubbleLp: WindowManager.LayoutParams
@@ -56,6 +79,19 @@ class BubbleService : Service() {
     private var pred = '-'
     private var lastCounted = -1   // -1 = kuch nahi, 0 = miss, 1 = hit (undo ke liye)
     private var panelOpen = false
+
+    // Money tracker
+    private var net = 0.0
+    private var staked = 0.0
+    private var wins = 0
+    private var losses = 0
+    private var lossStreak = 0
+    private var lastStake = 0
+    private var lastLost = false
+    private var stakeIdx = 2          // Rs 10
+    private var typeIdx = 0           // Big/Small
+    private var lossLimit = 300
+    private var moneySnap: MoneyState? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -141,16 +177,57 @@ class BubbleService : Service() {
             setPadding(0, dp(2), 0, dp(6))
         }
 
-        val rowMain = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(colorBtn("BIG", C_BIG) { addResult('B') })
-            addView(colorBtn("SMALL", C_SMALL) { addResult('S') })
+        // ---- Main view (v4 jaisa) ----
+        mainBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(predText)
+            addView(dotsText)
+            addView(bar)
+            addView(statText)
+            addView(hitText)
+            addView(row(colorBtn("BIG", C_BIG) { addResult('B') }, colorBtn("SMALL", C_SMALL) { addResult('S') }))
+            addView(
+                row(
+                    colorBtn("UNDO", C_GREY, 12f, 44) { undo() },
+                    colorBtn("RESET", C_GREY, 12f, 44) { reset() },
+                    colorBtn("MONEY", C_GREY, 12f, 44) { showMoney(true) },
+                    colorBtn("EXIT", C_GREY, 12f, 44) { stopSelf() }
+                )
+            )
         }
-        val rowSub = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(colorBtn("UNDO", C_GREY) { undo() })
-            addView(colorBtn("RESET", C_GREY) { reset() })
-            addView(colorBtn("EXIT", C_GREY) { stopSelf() })
+
+        // ---- Money view ----
+        moneyInfo = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(4), 0, dp(6))
+        }
+        moneyBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(moneyInfo)
+            addView(
+                row(
+                    colorBtn("STAKE -", C_GREY, 12f, 40) { changeStake(-1) },
+                    colorBtn("STAKE +", C_GREY, 12f, 40) { changeStake(1) },
+                    colorBtn("TYPE", C_GREY, 12f, 40) { nextType() }
+                )
+            )
+            addView(
+                row(
+                    colorBtn("WON", C_GREEN, 15f, 46) { recordBet(true) },
+                    colorBtn("LOST", C_RED, 15f, 46) { recordBet(false) },
+                    colorBtn("UNDO", C_GREY, 12f, 46) { undoMoney() }
+                )
+            )
+            addView(
+                row(
+                    colorBtn("LIMIT -", C_GREY, 12f, 40) { changeLimit(-100) },
+                    colorBtn("LIMIT +", C_GREY, 12f, 40) { changeLimit(100) },
+                    colorBtn("RESET", C_GREY, 12f, 40) { resetMoney() }
+                )
+            )
+            addView(row(colorBtn("BACK", C_PURPLE, 13f, 42) { showMoney(false) }))
         }
 
         val panelBg = GradientDrawable().apply {
@@ -162,13 +239,8 @@ class BubbleService : Service() {
             background = panelBg
             setPadding(dp(12), dp(10), dp(12), dp(10))
             visibility = View.GONE
-            addView(predText)
-            addView(dotsText)
-            addView(bar)
-            addView(statText)
-            addView(hitText)
-            addView(rowMain)
-            addView(rowSub)
+            addView(mainBox)
+            addView(moneyBox)
         }
 
         panelLp = WindowManager.LayoutParams(
@@ -182,16 +254,28 @@ class BubbleService : Service() {
         wm.addView(panel, panelLp)
     }
 
-    private fun colorBtn(label: String, bgColor: Int, onClick: () -> Unit) = Button(this).apply {
+    private fun row(vararg views: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        views.forEach { addView(it) }
+    }
+
+    private fun colorBtn(
+        label: String,
+        bgColor: Int,
+        textSz: Float = 14f,
+        minH: Int = 44,
+        onClick: () -> Unit
+    ) = Button(this).apply {
         val shape = GradientDrawable()
         shape.setColor(bgColor)
         shape.cornerRadius = dp(12).toFloat()
         text = label
-        textSize = 14f
+        textSize = textSz
         typeface = Typeface.DEFAULT_BOLD
         setTextColor(Color.WHITE)
-        minHeight = dp(44)
-        minimumHeight = dp(44)
+        minHeight = dp(minH)
+        minimumHeight = dp(minH)
+        setPadding(0, 0, 0, 0)
         background = shape
         val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         lp.setMargins(dp(3), dp(3), dp(3), dp(3))
@@ -240,6 +324,13 @@ class BubbleService : Service() {
         if (panelOpen) positionPanel()
     }
 
+    private fun showMoney(on: Boolean) {
+        mainBox.visibility = if (on) View.GONE else View.VISIBLE
+        moneyBox.visibility = if (on) View.VISIBLE else View.GONE
+        refresh()
+        if (panelOpen) positionPanel()
+    }
+
     private fun positionPanel() {
         val dm = resources.displayMetrics
         val w = dp(280)
@@ -258,7 +349,7 @@ class BubbleService : Service() {
         wm.updateViewLayout(panel, panelLp)
     }
 
-    // ---------- Logic ----------
+    // ---------- Big/Small logic (v4 jaisa) ----------
 
     private fun addResult(c: Char) {
         if (pred != '-') {
@@ -319,6 +410,74 @@ class BubbleService : Service() {
         }
     }
 
+    // ---------- Money logic ----------
+
+    private fun stake() = STAKES[stakeIdx]
+
+    private fun changeStake(d: Int) {
+        stakeIdx = (stakeIdx + d).coerceIn(0, STAKES.size - 1)
+        save()
+        refresh()
+    }
+
+    private fun nextType() {
+        typeIdx = (typeIdx + 1) % TYPES.size
+        save()
+        refresh()
+    }
+
+    private fun changeLimit(d: Int) {
+        lossLimit = (lossLimit + d).coerceAtLeast(100)
+        save()
+        refresh()
+    }
+
+    private fun recordBet(won: Boolean) {
+        moneySnap = MoneyState(net, wins, losses, lossStreak, staked, lastStake, lastLost)
+        val s = stake()
+        staked += s
+        if (won) {
+            net += s * PROFIT[typeIdx]
+            wins++
+            lossStreak = 0
+        } else {
+            net -= s
+            losses++
+            lossStreak++
+        }
+        lastStake = s
+        lastLost = !won
+        save()
+        refresh()
+    }
+
+    private fun undoMoney() {
+        val m = moneySnap ?: return
+        net = m.net
+        wins = m.wins
+        losses = m.losses
+        lossStreak = m.lossStreak
+        staked = m.staked
+        lastStake = m.lastStake
+        lastLost = m.lastLost
+        moneySnap = null
+        save()
+        refresh()
+    }
+
+    private fun resetMoney() {
+        net = 0.0
+        staked = 0.0
+        wins = 0
+        losses = 0
+        lossStreak = 0
+        lastStake = 0
+        lastLost = false
+        moneySnap = null
+        save()
+        refresh()
+    }
+
     // ---------- Show ----------
 
     private fun refresh() {
@@ -365,19 +524,48 @@ class BubbleService : Service() {
         val rate = if (total > 0) hits * 100 / total else 0
         hitText.text = "Hit rate: $hits/$total ($rate%) \u2022 50% = coin flip"
 
-        bubble.text = when (pred) {
-            'B' -> "B"
-            'S' -> "S"
-            else -> "?"
+        // Money
+        val limitHit = net <= -lossLimit.toDouble()
+        val chasing = lastLost && stake() > lastStake
+        val sign = if (net >= 0) "+" else "-"
+        val mb = StringBuilder()
+        mb.append("Net: ").append(sign).append("Rs ")
+            .append(String.format(Locale.US, "%.2f", abs(net))).append("\n")
+        mb.append("Lagaya: Rs ").append(staked.toInt())
+            .append("  |  Won ").append(wins).append("  Lost ").append(losses).append("\n")
+        mb.append("Stake: Rs ").append(stake()).append("  |  ").append(TYPES[typeIdx]).append("\n")
+        mb.append("Haar lagatar: ").append(lossStreak).append("  |  Limit: -Rs ").append(lossLimit)
+        if (limitHit) {
+            mb.append("\n!! LIMIT CROSS. Aaj ruk jao.")
+        } else if (lossStreak >= 3) {
+            mb.append("\n! ").append(lossStreak).append(" haar lagatar. Ruk jao.")
+        } else if (chasing) {
+            mb.append("\n! Haar ke baad bet badha rahe ho.")
         }
-        bubbleBg.setColor(
-            when (pred) {
-                'B' -> C_BIG
-                'S' -> C_SMALL
-                else -> C_PURPLE
+        moneyInfo.text = mb.toString()
+        moneyInfo.setTextColor(if (limitHit || lossStreak >= 3 || chasing) C_RED_SOFT else Color.WHITE)
+
+        // Circle: limit cross ho to laal "!"
+        if (limitHit) {
+            bubble.text = "!"
+            bubbleBg.setColor(C_RED)
+        } else {
+            bubble.text = when (pred) {
+                'B' -> "B"
+                'S' -> "S"
+                else -> "?"
             }
-        )
+            bubbleBg.setColor(
+                when (pred) {
+                    'B' -> C_BIG
+                    'S' -> C_SMALL
+                    else -> C_PURPLE
+                }
+            )
+        }
     }
+
+    // ---------- Save / Load ----------
 
     private fun load() {
         val saved = prefs.getString("log", null) ?: prefs.getString("h", "") ?: ""
@@ -386,6 +574,17 @@ class BubbleService : Service() {
         total = prefs.getInt("total", 0)
         lastCounted = prefs.getInt("lc", -1)
         pred = predict()
+
+        net = prefs.getString("net", "0")?.toDoubleOrNull() ?: 0.0
+        staked = prefs.getString("staked", "0")?.toDoubleOrNull() ?: 0.0
+        wins = prefs.getInt("mwins", 0)
+        losses = prefs.getInt("mlosses", 0)
+        lossStreak = prefs.getInt("mstreak", 0)
+        lastStake = prefs.getInt("mlaststake", 0)
+        lastLost = prefs.getBoolean("mlastlost", false)
+        stakeIdx = prefs.getInt("mstakeidx", 2).coerceIn(0, STAKES.size - 1)
+        typeIdx = prefs.getInt("mtype", 0).coerceIn(0, TYPES.size - 1)
+        lossLimit = prefs.getInt("mlimit", 300)
     }
 
     private fun save() {
@@ -394,6 +593,16 @@ class BubbleService : Service() {
             .putInt("hits", hits)
             .putInt("total", total)
             .putInt("lc", lastCounted)
+            .putString("net", net.toString())
+            .putString("staked", staked.toString())
+            .putInt("mwins", wins)
+            .putInt("mlosses", losses)
+            .putInt("mstreak", lossStreak)
+            .putInt("mlaststake", lastStake)
+            .putBoolean("mlastlost", lastLost)
+            .putInt("mstakeidx", stakeIdx)
+            .putInt("mtype", typeIdx)
+            .putInt("mlimit", lossLimit)
             .apply()
     }
 
