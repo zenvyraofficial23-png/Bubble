@@ -522,7 +522,7 @@ class BubbleService : Service() {
 
         statText.text = "Big $b  |  Small $s   (last $n)"
         val rate = if (total > 0) hits * 100 / total else 0
-        hitText.text = "Hit rate: $hits/$total ($rate%) \u2022 50% = coin flip"
+        hitText.text = "Hit rate: $hits/$total ($rate%) \u2022 break-even 51%"
 
         // Money
         val limitHit = net <= -lossLimit.toDouble()

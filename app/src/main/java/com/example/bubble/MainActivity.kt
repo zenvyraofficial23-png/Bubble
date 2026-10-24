@@ -17,6 +17,7 @@ class MainActivity : Activity() {
             )
         } else {
             startForegroundService(Intent(this, BubbleService::class.java))
+            startForegroundService(Intent(this, NumberService::class.java))
             finish()
         }
     }
